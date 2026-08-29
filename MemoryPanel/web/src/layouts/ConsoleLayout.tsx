@@ -11,7 +11,7 @@ import { useAuthStore } from '@/stores/auth';
 import { useCurrentRole, type TeamRole } from '@/services/useCurrentRole';
 import { GlobalHeader } from '@/layouts/GlobalHeader';
 import { TabBar } from '@/layouts/TabBar';
-import { OnboardingGuide, shouldShowOnboarding } from '@/layouts/OnboardingGuide';
+import { OnboardingGuide, shouldShowOnboarding, resetOnboarding } from '@/layouts/OnboardingGuide';
 import { ITEM_ICON, usePageMeta, GROUP_ORDER_KEYS, type PageId } from '@/constants/menu';
 
 const { Body, Sider, Content } = Layout;
@@ -69,11 +69,16 @@ export function ConsoleLayout() {
     }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const [openPages, setOpenPages] = useState<PageId[]>(() => [activePage]);
+  // 使用说明页为独立页（自带返回按钮与页头），不占用多标签页栏
+  const isGuide = location.pathname === '/guide';
+
+  const [openPages, setOpenPages] = useState<PageId[]>(() => (isGuide ? [] : [activePage]));
 
   useEffect(() => {
+    // /guide 独立页不把 workbench_board 等页面追加进标签栏，避免返回时多出标签
+    if (isGuide) return;
     setOpenPages((prev) => (prev.includes(activePage) ? prev : [...prev, activePage]));
-  }, [activePage]);
+  }, [activePage, isGuide]);
 
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
@@ -85,6 +90,25 @@ export function ConsoleLayout() {
       setOnboardingVisible(true);
     }
   }, [currentUserId]);
+
+  /**
+   * 回顾引导入口（由 GlobalHeader 的「我的资料 → 回顾引导」菜单项触发）：
+   * 清掉 onboarded 标记 + 把 Guide 重新置为可见。
+   * 必须先清标记再 setVisible，否则 Guide 内部的 close→markOnboarded 链路里
+   * 立刻又会重新标记为已看过（虽然本次不冲突，但下次自动判定仍会按"已看过"处理）。
+   */
+  const handleReplayOnboarding = useCallback(() => {
+    if (!currentUserId) return;
+    resetOnboarding(currentUserId);
+    setOnboardingVisible(true);
+  }, [currentUserId]);
+
+  // GuidePage 底部「引导回放」通过自定义事件触发与「我的资料 → 回顾引导」一致的链路
+  useEffect(() => {
+    const onReplay = () => handleReplayOnboarding();
+    window.addEventListener('tdai-replay-onboarding', onReplay);
+    return () => window.removeEventListener('tdai-replay-onboarding', onReplay);
+  }, [handleReplayOnboarding]);
 
   const navigateTo = useCallback(
     (id: PageId) => {
@@ -157,6 +181,8 @@ export function ConsoleLayout() {
         userRole={userRole}
         currentUser={auth?.user ?? ''}
         currentUserId={auth?.user_id}
+        instanceName={auth?.instance_name}
+        onReplayOnboarding={currentUserId ? handleReplayOnboarding : undefined}
         onLogout={logout}
       />
       <Layout>
@@ -173,12 +199,14 @@ export function ConsoleLayout() {
             </Menu>
           </Sider>
           <Content>
-            <TabBar
-              pages={openPages}
-              activePage={activePage}
-              onNavigate={navigateTo}
-              onClose={closePage}
-            />
+            {!isGuide && (
+              <TabBar
+                pages={openPages}
+                activePage={activePage}
+                onNavigate={navigateTo}
+                onClose={closePage}
+              />
+            )}
             <Content.Body className="_memory-content-body">
               {/* key 绑定 pathname：路由切换时重挂载页面帧，触发 _page-enter 过渡，保持跨页连续性 */}
               <main key={location.pathname} className="_memory-page-frame">
@@ -191,3 +219,4 @@ export function ConsoleLayout() {
     </div>
   );
 }
+ 

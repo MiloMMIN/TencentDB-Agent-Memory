@@ -5,6 +5,34 @@ import { getPanelSession } from '../panelSession';
 import { metaPost, metaListAll, getCurrentUser, request, ApiError } from './base';
 import type { MetaEnvelope, Agent, AssetType, AssetStatus, FixedAssetBinding } from './types';
 
+// ========================= 默认 Agent 模板 =========================
+
+export interface AgentTemplateAssetIds {
+  /** 团队 skill ID（skl-xxx） */
+  skills?: string[];
+  /** 团队 code graph ID（code-xxx） */
+  code_graphs?: string[];
+  /** 团队 wiki ID（wiki-xxx） */
+  wikis?: string[];
+}
+
+/**
+ * 默认 Agent 模板配置（agent/get-default-template / set-default-template 的 template 结构）。
+ * 注意：
+ *   - asset_ids 为团队资产 ID 快照，只允许选 visibility=team 的公共资产；
+ *   - 覆盖式写入：set 时需一次回传完整 template；
+ *   - metadata_json 为 JSON 字符串，ui.role_prompt / ui.rules_prompt 存拆分 prompt。
+ */
+export interface AgentTemplateConfig {
+  name: string;
+  description?: string | null;
+  prompt?: string | null;
+  /** 'private' | 'team'(默认) | 'restricted' */
+  visibility?: string;
+  metadata_json?: string;
+  asset_ids?: AgentTemplateAssetIds;
+}
+
 export const agentsApi = {
   /**
    * 列出 team 下的 agents。
@@ -90,8 +118,12 @@ export const agentsApi = {
   },
 
   /** 获取 agent 的资产聚合视图（binding + asset 详情）。
-   *  用 metaListAll 翻页拉全量（list-with-detail 默认 limit 20，绑定资产一多会被截断）。 */
-  getAssets: async (agentId: string) => {
+   *  用 metaListAll 翻页拉全量（list-with-detail 默认 limit 20，绑定资产一多会被截断）。
+   *
+   *  applyVisibilityFilter：默认 true（屏蔽已私密的绑定，用于普通展示）。
+   *  owner 视角管理自己的资产时应传 false —— 否则自己 owner 的 private skill
+   *  会被接口过滤掉，导致 fixed tab 拿不到它的 visibility、共享/私密切换按钮消失。 */
+  getAssets: async (agentId: string, applyVisibilityFilter = true) => {
     const items = await metaListAll<{
       asset_id: string;
       asset_type: AssetType;
@@ -104,7 +136,7 @@ export const agentsApi = {
       created_at: string;
     }>('agent-fixed-asset/list-with-detail', {
       agent_id: agentId,
-      apply_visibility_filter: true,
+      apply_visibility_filter: applyVisibilityFilter,
       touch_usage: false,
     });
     return items.map((item) => ({
@@ -150,4 +182,18 @@ export const agentsApi = {
       })),
     });
   },
+
+  /**
+   * 读取当前 team 的默认 Agent 模板（按 实例 × 团队 隔离，无权限校验）。
+   * 未配置时后端返回 `{}`，调用方以 `data.name` 是否存在判断「未配置」。
+   */
+  getDefaultTemplate: (teamId: string) =>
+    metaPost<AgentTemplateConfig>('agent/get-default-template', { team_id: teamId }),
+
+  /**
+   * 配置/覆盖当前 team 的默认 Agent 模板（仅 system_admin，否则 403 permission_denied）。
+   * 覆盖式写入：必须一次回传完整 template。
+   */
+  setDefaultTemplate: (teamId: string, template: AgentTemplateConfig) =>
+    metaPost<{ ok: boolean }>('agent/set-default-template', { team_id: teamId, template }),
 };
