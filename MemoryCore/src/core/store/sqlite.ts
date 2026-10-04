@@ -1789,7 +1789,7 @@ export class VectorStore implements IMemoryStore {
       return [];
     }
     try {
-      const { sessionKey, sessionId, taskId, updatedAfter } = filter ?? {};
+      const { sessionKey, sessionId, taskId, updatedAfter, recordIds } = filter ?? {};
 
       let raw: Record<string, unknown>[];
 
@@ -1827,6 +1827,13 @@ export class VectorStore implements IMemoryStore {
       if (filter?.userId !== undefined) rows = rows.filter((r) => r.user_id === filter.userId);
       if (filter?.agentId !== undefined) rows = rows.filter((r) => r.agent_id === filter.agentId);
       if (taskId !== undefined) rows = rows.filter((r) => r.task_id === taskId);
+      // Primary-key lookup used by /v2|v3/atomic/update; without this the
+      // handler read the first row of the whole table instead of the target
+      // record and failed its ownership check with a spurious 403.
+      if (recordIds !== undefined) {
+        const wanted = new Set(recordIds);
+        rows = rows.filter((r) => wanted.has(r.record_id));
+      }
 
       this.logger?.info(
         `${TAG} [L1-query] filter={sessionKey=${sessionKey ?? "(all)"}, sessionId=${sessionId ?? "(all)"}, teamId=${filter?.teamId ?? "(all)"}, userId=${filter?.userId ?? "(all)"}, agentId=${filter?.agentId ?? "(all)"}, taskId=${taskId ?? "(all)"}, updatedAfter=${updatedAfter ?? "(none)"}}, ` +

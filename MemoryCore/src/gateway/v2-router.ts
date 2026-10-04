@@ -4,7 +4,7 @@
  * Implements POST routes defined in `01-api-spec.yaml`:
  *
  *   L0 Conversation: add / query / search / delete
- *   L1 Atomic:       update / query / search / delete
+ *   L1 Atomic:       create / update / query / search / delete
  *   L2 Scenario:     ls / read / write / rm
  *   L3 Core:         read / write
  *
@@ -15,6 +15,7 @@
  */
 
 import { createHash, randomUUID } from "node:crypto";
+import * as z from "zod";
 import type http from "node:http";
 import { classifyError } from "./error-handler.js";
 import type { IMemoryStore, L0Record, ProfileSyncRecord } from "../core/store/types.js";
@@ -27,6 +28,7 @@ import type { PipelineWorker } from "../services/pipeline-worker.js";
 import { executeMemorySearch } from "../core/tools/memory-search.js";
 import { executeConversationSearch } from "../core/tools/conversation-search.js";
 import type { MemoryRecord } from "../core/record/l1-writer.js";
+import { generateMemoryId } from "../core/record/l1-writer.js";
 import { reportRecallMetrics } from "../core/report/metric-tracking-recall.js";
 
 // ── Zod schemas (validated types + defaults) ──
@@ -92,6 +94,7 @@ import {
   type AgentData,
   type TaskData,
 } from "./v2-schemas.js";
+import { idFieldsSchema } from "./generated/schemas.js";
 import { stripSceneNavigation } from "../core/scene/scene-navigation.js";
 import { buildProfileIsolationScope, buildProfileStableId, DEFAULT_PROFILE_SCOPE } from "../core/profile/profile-sync.js";
 
@@ -156,6 +159,7 @@ const V3_ALLOWED_SUBPATHS = new Set<string>([
   "/conversation/search",
   "/conversation/delete",
   "/conversation/count",
+  "/atomic/create",
   "/atomic/update",
   "/atomic/query",
   "/atomic/search",
@@ -178,15 +182,15 @@ const V3_ALLOWED_SUBPATHS = new Set<string>([
  *   - 原始 L0/L1/L2/L3 表完全不动，本函数只追加事件
  *   - team/agent/user/task 来自外部请求 IdFields（resolveIsolation 后的 ctx）
  *   - L0 不参与（不可变流水）
- *   - 5 个 mutation handler 各调一次：
- *     atomic/update + atomic/delete + scenario/write + scenario/rm + core/write
+ *   - 6 个 mutation handler 各调一次：
+ *     atomic/create + atomic/update + atomic/delete + scenario/write + scenario/rm + core/write
  */
 async function recordAudit(
   store: IMemoryStore | undefined,
   args: {
     record_id: string;
     layer: "L1" | "L2" | "L3";
-    action: "update" | "delete";
+    action: "create" | "update" | "delete";
     iso?: { teamId?: string; userId?: string; agentId?: string; sessionId?: string; taskId?: string };
     version: number;
     requestId: string;
@@ -416,6 +420,7 @@ const DATAPLANE_HANDLERS: Record<string, RouteHandler> = {
   "/conversation/search": handleConversationSearch,
   "/conversation/delete": handleConversationDelete,
   "/conversation/count": handleConversationCount,
+  "/atomic/create": handleAtomicCreate,
   "/atomic/update": handleAtomicUpdate,
   "/atomic/query": handleAtomicQuery,
   "/atomic/search": handleAtomicSearch,
@@ -1039,6 +1044,65 @@ async function handleConversationDelete(body: unknown, auth: V2AuthContext, requ
   }
 
   return successEnvelope<ConversationDeleteData>({ deleted_count: deletedCount }, requestId);
+}
+
+/** L1 新建请求：content 必填；type 缺省 persona，priority 缺省 50。 */
+const atomicCreateRequestSchema = z.lazy(() => idFieldsSchema).and(z.object({
+  content: z.string().min(1),
+  background: z.optional(z.string()),
+  type: z.optional(z.enum(["persona", "episodic", "instruction"])),
+  priority: z.optional(z.number()),
+}));
+
+async function handleAtomicCreate(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
+  const parsed = atomicCreateRequestSchema.safeParse(body);
+  if (!parsed.success) return errorEnvelope(400, formatZodError(parsed.error), requestId);
+  const { content, background, type, priority } = parsed.data;
+
+  const store = deps.getStore();
+  if (!store) return errorEnvelope(503, "Store not available", requestId);
+
+  const iso = deps.requestIsolation;
+  const now = new Date().toISOString();
+  const id = generateMemoryId();
+  const record: MemoryRecord = {
+    id,
+    content,
+    type: (type as MemoryRecord["type"]) ?? "persona",
+    priority: priority ?? 50,
+    scene_name: background ?? "",
+    source_message_ids: [],
+    metadata: {},
+    timestamps: [],
+    createdAt: now,
+    updatedAt: now,
+    version: 1,
+    sessionKey: "",
+    sessionId: iso?.sessionId ?? "",
+    taskId: iso?.taskId,
+    teamId: iso?.teamId,
+    userId: iso?.userId,
+    agentId: iso?.agentId,
+  };
+
+  const embedding = deps.getEmbedding();
+  let emb: Float32Array | undefined;
+  if (embedding) { try { emb = await embedding.embed(content); } catch (e) { console.warn(`[v2-router] L1 embedding failed:`, e); } }
+
+  await store.upsertL1(record, emb);
+
+  // 审计：L1 create
+  await recordAudit(store, {
+    record_id: id,
+    layer: "L1",
+    action: "create",
+    iso,
+    version: 1,
+    requestId,
+    logger: deps.logger,
+  });
+
+  return successEnvelope<AtomicUpdateData>({ id, version: "v1", updated_at: now }, requestId);
 }
 
 async function handleAtomicUpdate(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
@@ -1914,15 +1978,16 @@ async function handleScenarioWrite(body: unknown, _auth: V2AuthContext, requestI
 
   const key = `${StoragePaths.sceneBlocksDir}${path}`;
 
-  // Existence check: path must already exist (no upsert/create)
+  // Upsert semantics: existing file → update (preserve META.created);
+  // missing file → create with a fresh META block.
   const existing = await storage.readFile(key);
-  if (existing === null) return errorEnvelope(404, `Scenario file not found: ${path}`, requestId);
+  const isCreate = existing === null;
 
   // Parse existing META to preserve created + update updated/summary
   const now = new Date().toISOString();
   let finalContent: string;
 
-  const metaMatch = existing.match(/^-----META-START-----\n([\s\S]*?)\n-----META-END-----\n?/);
+  const metaMatch = existing?.match(/^-----META-START-----\n([\s\S]*?)\n-----META-END-----\n?/);
   if (metaMatch) {
     // Parse existing META fields
     const metaBlock = metaMatch[1];
@@ -1939,7 +2004,7 @@ async function handleScenarioWrite(body: unknown, _auth: V2AuthContext, requestI
     const newMeta = Object.entries(metaFields).map(([k, v]) => `${k}: ${v}`).join("\n");
     finalContent = `-----META-START-----\n${newMeta}\n-----META-END-----\n\n${content}`;
   } else {
-    // META missing or corrupted — rebuild
+    // META missing/corrupted, or new file — build a fresh META block
     const metaLines = [
       `created: ${now}`,
       `updated: ${now}`,
@@ -1955,11 +2020,11 @@ async function handleScenarioWrite(body: unknown, _auth: V2AuthContext, requestI
   const version = await syncProfileToVdb(store, "l2", path, finalContent, deps.logger, undefined, deps.requestIsolation);
   await refreshSceneIndex(storage, deps.logger);
 
-  // 审计：L2 update — record_id 用 path（L2 主键 = 文件路径）
+  // 审计：L2 create/update — record_id 用 path（L2 主键 = 文件路径）
   await recordAudit(store, {
     record_id: path,
     layer: "L2",
-    action: "update",
+    action: isCreate ? "create" : "update",
     iso: deps.requestIsolation,
     version,
     requestId,
