@@ -1058,21 +1058,30 @@ async function handleConversationDelete(body: unknown, auth: V2AuthContext, requ
   return successEnvelope<ConversationDeleteData>({ deleted_count: deletedCount }, requestId);
 }
 
-/** L1 新建请求：content 必填；type 缺省 persona，priority 缺省 50。 */
+/** L1 新建请求：content 必填且与 update 同上限 8192；type 缺省 persona，priority 缺省 50。
+ * priority 域为 0-100，-1 保留给 strict global instructions；越界值在 API 边界拒绝。 */
 const atomicCreateRequestSchema = z.lazy(() => idFieldsSchema).and(z.object({
-  content: z.string().min(1),
+  content: z.string().min(1).max(8192),
   background: z.optional(z.string()),
   type: z.optional(z.enum(["persona", "episodic", "instruction"])),
-  priority: z.optional(z.number()),
+  priority: z.optional(z.number().min(0).max(100).or(z.literal(-1))),
 }));
 
-async function handleAtomicCreate(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
+async function handleAtomicCreate(body: unknown, auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
   const parsed = atomicCreateRequestSchema.safeParse(body);
   if (!parsed.success) return errorEnvelope(400, formatZodError(parsed.error), requestId);
   const { content, background, type, priority } = parsed.data;
 
   const store = deps.getStore();
   if (!store) return errorEnvelope(503, "Store not available", requestId);
+
+  // Quota check: memory limit (service mode)
+  if (deps.quotaManager) {
+    const check = await deps.quotaManager.checkMemoryQuota(auth.serviceId, 1);
+    if (!check.allowed) {
+      return errorEnvelope(4291, `Memory limit exceeded (current=${check.current}, limit=${check.limit})`, requestId);
+    }
+  }
 
   const iso = deps.requestIsolation;
   const now = new Date().toISOString();
@@ -1103,6 +1112,11 @@ async function handleAtomicCreate(body: unknown, _auth: V2AuthContext, requestId
 
   const upserted = await store.upsertL1(record, emb);
   if (!upserted) return errorEnvelope(503, "Failed to create atomic note", requestId);
+
+  // Report memory usage (non-fatal)
+  if (deps.quotaManager) {
+    deps.quotaManager.reportMemoryAdded(auth.serviceId, 1).catch(() => {});
+  }
 
   // 审计：L1 create
   await recordAudit(store, {
