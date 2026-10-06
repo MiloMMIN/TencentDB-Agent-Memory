@@ -1101,7 +1101,8 @@ async function handleAtomicCreate(body: unknown, _auth: V2AuthContext, requestId
   let emb: Float32Array | undefined;
   if (embedding) { try { emb = await embedding.embed(content); } catch (e) { console.warn(`[v2-router] L1 embedding failed:`, e); } }
 
-  await store.upsertL1(record, emb);
+  const upserted = await store.upsertL1(record, emb);
+  if (!upserted) return errorEnvelope(503, "Failed to create atomic note", requestId);
 
   // 审计：L1 create
   await recordAudit(store, {
